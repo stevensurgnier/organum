@@ -11,20 +11,20 @@
 (defn drawer [] (node :drawer))
 (defn line [type text] {:line-type type :text text})
 
-(defn classify-line
-  "Classify a line for dispatch to handle-line multimethod."
-  [ln]
+(def rules
   (let [headline-re #"^(\*+)\s*(.*)$"
         headline-fn #(when-let [[_ pre text] (re-matches headline-re %)]
                        [pre text])
-        pdrawer-re #"^\s*:(PROPERTIES|END):"
-        pdrawer #(second (re-matches pdrawer-re %))
-        pdrawer-item-re #"^\s*:([0-9A-Za-z_\-]+):\s*(.*)$"
+        pdrawer-begin-re #"^\s*:PROPERTIES:"
+        pdrawer-end-re #"^\s*:END:"
+        pdrawer-item-re #"^\s*:(.+):\s*(.+)\s*$"
+        pdrawer-item-fn #(when-let [[_ prop v] (re-matches pdrawer-item-re %)]
+                           [prop v])
         begin-block-re #"^#\+(BEGIN)_(\w+)\s*([\w\-]*)?.*"
         end-block-re #"^#\+(END)_(\w+)\s*([\w\-]*)?.*"
-        block (fn [re ln]
-                (when-let [[_ begin-end type qualifier] (re-matches re ln)]
-                  [begin-end type qualifier]))
+        block-fn (fn [re ln]
+                   (when-let [[_ begin-end type qualifier] (re-matches re ln)]
+                     [begin-end type qualifier]))
         def-list-re #"^\s*(-|\+|\s+[*])\s*(.*?)::.*"
         ordered-list-re #"^\s*\d+(\.|\))\s+.*"
         unordered-list-re #"^\s*(-|\+|\s+[*])\s+.*"
@@ -37,31 +37,36 @@
         comment-fn #(nth (re-matches comment-re %) 1)
         property-re #"^#\+(.+):\s*(.+)"
         property-fn #(when-let [[_ property v] (re-matches property-re %)]
-                       [property v])
-        conds [:headline headline-fn
-               :blank string/blank?
-               :definition-list (partial re-matches def-list-re)
-               :ordered-list (partial re-matches ordered-list-re)
-               :unordered-list (partial re-matches unordered-list-re)
-               :property-drawer-begin-block #(= (pdrawer %) "PROPERTIES")
-               :property-drawer-end-block #(= (pdrawer %) "END")
-               :property-drawer-item (partial re-matches pdrawer-item-re)
-               :metadata (partial re-matches metadata-re)
-               :begin-block (partial block begin-block-re)
-               :end-block (partial block end-block-re)
-               :comment comment-fn
-               :property  property-fn
-               :table-separator (partial re-matches table-sep-re)
-               :table-row (partial re-matches table-row-re)
-               :inline-example (partial re-matches inline-example-re)
-               :horizontal-rule (partial re-matches horiz-re)
-               :paragraph identity]]
-    ;; lazily evaluate each rule, returning the first non nil value
-    (->> conds
-         (partition 2)
-         (map (fn [[k f]] [k (f ln)]))
-         (filter second)
-         first)))
+                       [property v])]
+    [:headline headline-fn
+     :blank #(when (string/blank? %) "")
+     :definition-list (partial re-matches def-list-re)
+     :ordered-list (partial re-matches ordered-list-re)
+     :unordered-list (partial re-matches unordered-list-re)
+     :property-drawer-begin-block (partial re-matches pdrawer-begin-re)
+     :property-drawer-end-block (partial re-matches pdrawer-end-re)
+     :property-drawer-item pdrawer-item-fn
+     :metadata (partial re-matches metadata-re)
+     :begin-block (partial block-fn begin-block-re)
+     :end-block (partial block-fn end-block-re)
+     :comment comment-fn
+     :property  property-fn
+     :table-separator (partial re-matches table-sep-re)
+     :table-row (partial re-matches table-row-re)
+     :inline-example (partial re-matches inline-example-re)
+     :horizontal-rule (partial re-matches horiz-re)
+     :paragraph identity]))
+
+(defn classify-line
+  "Classify a line for dispatch to handle-line multimethod."
+  ([ln] (classify-line rules ln))
+  ([rules ln]
+     ;; lazily evaluate each rule, returning the first non nil value
+     (->> rules
+          (partition 2)
+          (map (fn [[k f]] [k (f ln)]))
+          (filter second)
+          first)))
 
 (defn strip-tags
   "Return the line with tags stripped out and list of tags"
@@ -76,7 +81,7 @@
   (let [keywords-re #"(TODO|DONE)?"
         words (string/split ln #"\s+")]
     (if (re-matches keywords-re (words 0))
-      [(string/triml (string/replace-first ln (words 0) "")) (words 0)] 
+      [(string/triml (string/replace-first ln (words 0) "")) (words 0)]
       [ln nil])))
 
 (defn parse-headline
@@ -107,26 +112,33 @@
     (subsume state top)))
 
 (defn handle-line
-  [state ln]
-  (let [[class value] (classify-line ln)]
-    (case class
-      :headline (conj state (apply parse-headline value))
-      :begin-block (conj state (apply parse-block value))
-      :end-block (subsume-top state)
-      :property-drawer-begin-block (conj state (drawer))
-      :property-drawer-end-block (subsume-top state)
-      ;; default
-      (subsume state (line class value)))))
+  ([state ln] (handle-line rules state ln))
+  ([rules state ln]
+     (let [[class value] (classify-line rules ln)]
+       (case class
+         :headline (conj state (apply parse-headline value))
+         :begin-block (conj state (apply parse-block value))
+         :end-block (subsume-top state)
+         :property-drawer-begin-block (conj state (drawer))
+         :property-drawer-end-block (subsume-top state)
+         ;; default
+         (subsume state (line class value))))))
 
-(def parse-seq (partial reduce handle-line [(root)]))
+(defn parse-seq
+  ([lines] (parse-seq rules lines))
+  ([rules lines]
+     (reduce (partial handle-line rules) [(root)] lines)))
 
-(defn parse-lines [lines]
-  (parse-seq (string/split-lines lines)))
+(defn parse-lines
+  ([lines] (parse-lines rules lines))
+  ([rules lines]
+     (parse-seq rules (string/split-lines lines))))
 
 (defn parse-file
   "Parse file (name / url / File) into (flat) sequence of sections.
    First section may be type :root, subsequent are type :section.
    Other parsed representations may be contained within the sections"
-  [f]
-  (with-open [rdr (io/reader f)]
-    (parse-seq (line-seq rdr))))
+  ([f] (parse-file rules f))
+  ([rules f]
+     (with-open [rdr (io/reader f)]
+       (parse-seq rules (line-seq rdr)))))
